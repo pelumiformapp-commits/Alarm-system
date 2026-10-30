@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -32,7 +33,14 @@ class LocationService : Service() {
         token = p.getString("token", "") ?: ""
         chat = p.getString("chat", "") ?: ""
 
-        startForeground(1, buildNote())
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(
+                1, buildNote(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            )
+        } else {
+            startForeground(1, buildNote())
+        }
 
         lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         try {
