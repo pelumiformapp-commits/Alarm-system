@@ -20,51 +20,81 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import kotlin.math.sqrt
 
 class LocationService : Service() {
 
     private lateinit var lm: LocationManager
     private lateinit var sensorManager: SensorManager
     private var accel: Sensor? = null
+
     private var token = ""
     private var chat = ""
     private var name = "Guard"
     private var armed = false
-    private var lastSent = 0L
+    private var shakeEnabled = false
+
     private var lastAlarm = 0L
+    private var lastShakeSOS = 0L
     private var started = false
     @Volatile private var running = false
     private var updateOffset = 0L
     private var ringtone: Ringtone? = null
+    private val alarmHandler = Handler(Looper.getMainLooper())
+    private var alarmStopRunnable: Runnable? = null
+
+    private val timerHandler = Handler(Looper.getMainLooper())
+    private var emergencyTimerActive = false
+    private var emergencyRunnable: Runnable? = null
 
     private val listener = object : LocationListener {
-        override fun onLocationChanged(l: Location) { report(l) }
+        override fun onLocationChanged(l: Location) { /* no auto message — kept for /locate and SOS */ }
         override fun onStatusChanged(p: String?, s: Int, e: Bundle?) {}
         override fun onProviderEnabled(p: String) {}
         override fun onProviderDisabled(p: String) {}
     }
 
     private val motionListener = object : SensorEventListener {
+        private val shakeTimes = mutableListOf<Long>()
+
         override fun onSensorChanged(e: SensorEvent) {
-            if (!armed) return
             val x = e.values[0]; val y = e.values[1]; val z = e.values[2]
-            val mag = kotlin.math.sqrt((x * x + y * y + z * z).toDouble())
-            if (mag > 28) triggerAlarm()
+            val mag = sqrt((x * x + y * y + z * z).toDouble())
+
+            if (armed && mag > 28) triggerAlarm()
+
+            if (shakeEnabled && mag > 20) {
+                val now = System.currentTimeMillis()
+                shakeTimes.add(now)
+                shakeTimes.removeAll { now - it > 1500 }
+                if (shakeTimes.size >= 4) {
+                    shakeTimes.clear()
+                    triggerShakeSOS()
+                }
+            }
         }
         override fun onAccuracyChanged(s: Sensor?, a: Int) {}
     }
 
-    override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+    override fun onStartCommand(i: Intent?, flags: Int, id: Int): Int {
         val p = getSharedPreferences("cfg", MODE_PRIVATE)
         token = p.getString("token", "") ?: ""
         chat = p.getString("chat", "") ?: ""
         name = p.getString("name", "")?.ifBlank { "Guard" } ?: "Guard"
         armed = p.getBoolean("armed", false)
+        shakeEnabled = p.getBoolean("shake", false)
 
         if (Build.VERSION.SDK_INT >= 29) {
             startForeground(1, buildNote(), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
         } else {
             startForeground(1, buildNote())
+        }
+
+        when (i?.action) {
+            "START_TIMER" -> { scheduleEmergencyTimer(i.getIntExtra("minutes", 10)); return START_STICKY }
+            "CANCEL_TIMER" -> { cancelEmergencyTimerInternal(); return START_STICKY }
+            "STOP_ALARM" -> { stopAlarmNow(); return START_STICKY }
         }
 
         lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
@@ -114,6 +144,15 @@ class LocationService : Service() {
     }
 
     private fun replyWithLocation() {
+        val l = bestLocation()
+        if (l != null) {
+            Telegram.send(token, chat, "$name: https://maps.google.com/?q=${l.latitude},${l.longitude} (${l.accuracy.toInt()}m)")
+        } else {
+            Telegram.send(token, chat, "$name: no location fix yet")
+        }
+    }
+
+    private fun bestLocation(): Location? {
         var best: Location? = null
         try {
             for (prov in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
@@ -122,12 +161,7 @@ class LocationService : Service() {
             }
         } catch (e: SecurityException) {
         }
-        val l = best
-        if (l != null) {
-            Telegram.send(token, chat, "$name: https://maps.google.com/?q=${l.latitude},${l.longitude} (${l.accuracy.toInt()}m)")
-        } else {
-            Telegram.send(token, chat, "$name: no location fix yet")
-        }
+        return best
     }
 
     private fun triggerAlarm() {
@@ -136,21 +170,66 @@ class LocationService : Service() {
         lastAlarm = now
         Telegram.send(token, chat, "$name: motion alarm triggered")
         SilentCamera.capture(applicationContext, token, chat, name, "motion alarm photo")
+        playAlarm()
+    }
+
+    private fun playAlarm() {
         try {
+            alarmStopRunnable?.let { alarmHandler.removeCallbacks(it) }
             ringtone = RingtoneManager.getRingtone(
                 this, RingtoneManager.getActualDefaultRingtoneUri(this, RingtoneManager.TYPE_ALARM)
             )
             ringtone?.play()
-            Handler(mainLooper).postDelayed({ try { ringtone?.stop() } catch (e: Exception) {} }, 15000)
+            val r = Runnable { stopAlarmNow() }
+            alarmStopRunnable = r
+            alarmHandler.postDelayed(r, 15000)
         } catch (e: Exception) {
         }
     }
 
-    private fun report(l: Location) {
+    private fun stopAlarmNow() {
+        alarmStopRunnable?.let { alarmHandler.removeCallbacks(it) }
+        try { ringtone?.stop() } catch (e: Exception) {}
+    }
+
+    private fun triggerShakeSOS() {
         val now = System.currentTimeMillis()
-        if (now - lastSent < 120000) return
-        lastSent = now
-        Telegram.send(token, chat, "$name: https://maps.google.com/?q=${l.latitude},${l.longitude} (${l.accuracy.toInt()}m)")
+        if (now - lastShakeSOS < 20000) return
+        lastShakeSOS = now
+        fireAutoSOS("shake-to-SOS triggered")
+    }
+
+    private fun fireAutoSOS(reason: String) {
+        Telegram.send(token, chat, "🚨 $name: EMERGENCY — $reason")
+        val l = bestLocation()
+        if (l != null) {
+            Telegram.send(token, chat, "🚨 $name: https://maps.google.com/?q=${l.latitude},${l.longitude} (${l.accuracy.toInt()}m)")
+        } else {
+            Telegram.send(token, chat, "🚨 $name: no location fix available")
+        }
+        SilentCamera.capture(applicationContext, token, chat, name, "$reason photo")
+    }
+
+    private fun scheduleEmergencyTimer(minutes: Int) {
+        emergencyRunnable?.let { timerHandler.removeCallbacks(it) }
+        emergencyTimerActive = true
+        val mins = minutes.coerceIn(1, 180)
+        val r = Runnable {
+            if (emergencyTimerActive) {
+                emergencyTimerActive = false
+                fireAutoSOS("safety timer expired — not cancelled")
+            }
+        }
+        emergencyRunnable = r
+        timerHandler.postDelayed(r, mins * 60_000L)
+        Telegram.send(token, chat, "$name: safety timer started ($mins min) — will alert if not cancelled")
+    }
+
+    private fun cancelEmergencyTimerInternal() {
+        if (!emergencyTimerActive) return
+        emergencyTimerActive = false
+        emergencyRunnable?.let { timerHandler.removeCallbacks(it) }
+        Telegram.send(token, chat, "$name: safety timer cancelled — all clear")
     }
 
     private fun buildNote(): Notification {
@@ -171,6 +250,8 @@ class LocationService : Service() {
 
     override fun onDestroy() {
         running = false
+        emergencyRunnable?.let { timerHandler.removeCallbacks(it) }
+        alarmStopRunnable?.let { alarmHandler.removeCallbacks(it) }
         if (::lm.isInitialized) {
             try { lm.removeUpdates(listener) } catch (e: SecurityException) {}
         }
