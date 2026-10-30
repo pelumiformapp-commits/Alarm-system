@@ -13,6 +13,6 @@ class AdminReceiver : DeviceAdminReceiver() {
         val name = p.getString("name", "")?.ifBlank { "Guard" } ?: "Guard"
         if (token.isBlank() || chat.isBlank()) return
         Telegram.send(token, chat, "$name: wrong passcode entered")
-        SilentCamera.capture(token, chat, name, "wrong passcode photo")
+        SilentCamera.capture(context, token, chat, name, "wrong passcode photo")
     }
 }
