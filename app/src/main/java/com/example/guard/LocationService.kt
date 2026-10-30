@@ -135,7 +135,7 @@ class LocationService : Service() {
         if (now - lastAlarm < 30000) return
         lastAlarm = now
         Telegram.send(token, chat, "$name: motion alarm triggered")
-        SilentCamera.capture(token, chat, name, "motion alarm photo")
+        SilentCamera.capture(applicationContext, token, chat, name, "motion alarm photo")
         try {
             ringtone = RingtoneManager.getRingtone(
                 this, RingtoneManager.getActualDefaultRingtoneUri(this, RingtoneManager.TYPE_ALARM)
